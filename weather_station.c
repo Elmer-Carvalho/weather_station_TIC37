@@ -54,6 +54,7 @@
 #define WIFI_SSID "Minha Internet"
 #define WIFI_PASS "minhasenha157"
 #define TCP_TIMEOUT_MS 10000 // Timeout de 10 segundos para conexões inativas
+#define TCP_CHUNK_SIZE 512   // Tamanho máximo de cada pedaço de dados enviado
 
 // Limites padrão saudáveis para humanos
 #define TEMP_MIN_DEFAULT 15.0f
@@ -85,6 +86,8 @@ typedef struct
     struct tcp_pcb *pcb;
     absolute_time_t timeout;
     bool response_sent;
+    const char *remaining_data; // Dados a serem enviados em pedaços
+    size_t remaining_len;       // Tamanho restante
 } conn_state_t;
 
 // ===================== VARIÁVEIS GLOBAIS =====================
@@ -117,23 +120,24 @@ void tarefa_alerta(void *param);
 void tarefa_display(void *param);
 void manipulador_interrupcao_gpio(uint gpio, uint32_t eventos);
 void tratar_botao(uint btn);
-static err_t webserver_sent(void *arg, struct tcp_pcb *tpcb, u16_t len);
+static err_t webserver_sent(void *arg, struct tcp_pcb * comerciales, u16_t len);
 static err_t webserver_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
 static err_t webserver_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
 void send_http_response(struct tcp_pcb *tpcb, const char *header, const char *body, conn_state_t *state);
 
 // ===================== HTML/CSS/JS EMBUTIDO =====================
+// Página HTML otimizada para reduzir tamanho
 const char *html_page =
     "<!DOCTYPE html><html lang='pt'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Estação BitDogLab</title>"
-    "<style>body{font-family:sans-serif;margin:0;padding:20px;background:#222;color:#eee;}h1{font-size:1.5em;}#dados{margin:1em 0;font-size:1.2em;}input,button{font-size:1em;padding:5px;}@media(max-width:600px){body{font-size:1.1em;padding:10px;}}</style>"
-    "</head><body><h1>Estação Meteorológica BitDogLab</h1><div id='dados'>Carregando...</div><canvas id='grafico' width='300' height='100'></canvas>"
-    "<form id='cfg'><h2>Configuração</h2>"
-    "Temp:<input name='temp_min' type='number' step='0.1' placeholder='Mín'/>-<input name='temp_max' type='number' step='0.1' placeholder='Máx'/><br>"
-    "Umid:<input name='hum_min' type='number' step='0.1' placeholder='Mín'/>-<input name='hum_max' type='number' step='0.1' placeholder='Máx'/><br>"
-    "Press:<input name='press_min' type='number' step='0.1' placeholder='Mín'/>-<input name='press_max' type='number' step='0.1' placeholder='Máx'/><br>"
-    "Offsets: T:<input name='temp_offset' type='number' step='0.1'/> U:<input name='hum_offset' type='number' step='0.1'/> P:<input name='press_offset' type='number' step='0.1'/><br>"
+    "<style>body{font-family:sans-serif;margin:0;padding:10px;background:#222;color:#eee}h1{font-size:1.5em}#dados{margin:1em 0;font-size:1.1em}input,button{font-size:1em;padding:3px}@media(max-width:600px){body{font-size:1em}}</style>"
+    "</head><body><h1>Estação Meteorológica</h1><div id='dados'>Carregando...</div><canvas id='grafico' width='300' height='100'></canvas>"
+    "<form id='cfg'><h2>Config</h2>"
+    "Temp:<input name='temp_min' type='number' step='0.1' placeholder='Mín'>-<input name='temp_max' type='number' step='0.1' placeholder='Máx'><br>"
+    "Umid:<input name='hum_min' type='number' step='0.1' placeholder='Mín'>-<input name='hum_max' type='number' step='0.1' placeholder='Máx'><br>"
+    "Press:<input name='press_min' type='number' step='0.1' placeholder='Mín'>-<input name='press_max' type='number' step='0.1' placeholder='Máx'><br>"
+    "Offsets: T:<input name='temp_offset' type='number' step='0.1'> U:<input name='hum_offset' type='number' step='0.1'> P:<input name='press_offset' type='number' step='0.1'><br>"
     "<button type='submit'>Salvar</button></form>"
-    "<script>let dados=[];function atualiza(){fetch('/json').then(r=>r.json()).then(j=>{document.getElementById('dados').innerHTML=`Temp: ${j.temp_aht20}°C, Umid: ${j.hum_aht20}%, Press: ${j.press_bmp280}hPa`;dados.push(j);if(dados.length>50)dados.shift();let c=document.getElementById('grafico').getContext('2d');c.clearRect(0,0,300,100);c.strokeStyle='#0f0';c.beginPath();for(let i=0;i<dados.length;i++){let y=100-((dados[i].temp_aht20-0)*2);c.lineTo(i*6,y);}c.stroke();}).catch(e=>console.error('Erro:',e));}setInterval(atualiza,2000);atualiza();document.getElementById('cfg').onsubmit=e=>{e.preventDefault();let f=new FormData(e.target);fetch('/cfg',{method:'POST',body:new URLSearchParams(f)}).then(()=>alert('Configuração salva!')).catch(e=>alert('Erro ao salvar configuração.'));};</script></body></html>";
+    "<script>let d=[];function atualiza(){fetch('/json').then(r=>r.json()).then(j=>{document.getElementById('dados').innerHTML=`Temp: ${j.temp_aht20}°C, Umid: ${j.hum_aht20}%, Press: ${j.press_bmp280}hPa`;d.push(j);if(d.length>50)d.shift();let c=document.getElementById('grafico').getContext('2d');c.clearRect(0,0,300,100);c.strokeStyle='#0f0';c.beginPath();for(let i=0;i<d.length;i++){let y=100-(d[i].temp_aht20*2);c.lineTo(i*6,y);}c.stroke();}).catch(e=>console.error('Erro:',e));}setInterval(atualiza,2000);atualiza();document.getElementById('cfg').onsubmit=e=>{e.preventDefault();let f=new FormData(e.target);fetch('/cfg',{method:'POST',body:new URLSearchParams(f)}).then(()=>alert('Config salva!')).catch(e=>alert('Erro ao salvar.'));}</script></body></html>";
 
 // ===================== FUNÇÃO PRINCIPAL =====================
 int main()
@@ -388,18 +392,37 @@ void send_http_response(struct tcp_pcb *tpcb, const char *header, const char *bo
     if (err != ERR_OK)
     {
         printf("[ERRO] Falha ao enviar cabeçalho HTTP: %d\n", err);
+        tcp_close(tpcb);
+        free(state);
         return;
     }
 
-    // Envia o corpo, se existir
+    // Inicializa o envio do corpo em pedaços
     if (body)
     {
-        err = tcp_write(tpcb, body, strlen(body), TCP_WRITE_FLAG_COPY);
+        state->remaining_data = body;
+        state->remaining_len = strlen(body);
+    }
+    else
+    {
+        state->remaining_data = NULL;
+        state->remaining_len = 0;
+    }
+
+    // Envia o primeiro pedaço (ou todo o corpo, se pequeno)
+    size_t to_send = state->remaining_len > TCP_CHUNK_SIZE ? TCP_CHUNK_SIZE : state->remaining_len;
+    if (to_send > 0)
+    {
+        err = tcp_write(tpcb, state->remaining_data, to_send, TCP_WRITE_FLAG_COPY);
         if (err != ERR_OK)
         {
-            printf("[ERRO] Falha ao enviar corpo HTTP: %d\n", err);
+            printf("[ERRO] Falha ao enviar pedaço do corpo HTTP: %d\n", err);
+            tcp_close(tpcb);
+            free(state);
             return;
         }
+        state->remaining_data += to_send;
+        state->remaining_len -= to_send;
     }
 
     // Força o envio dos dados
@@ -407,18 +430,49 @@ void send_http_response(struct tcp_pcb *tpcb, const char *header, const char *bo
     if (err != ERR_OK)
     {
         printf("[ERRO] Falha ao forçar envio TCP: %d\n", err);
+        tcp_close(tpcb);
+        free(state);
         return;
     }
 
-    state->response_sent = true; // Marca a resposta como enviada
+    // Marca a resposta como iniciada
+    state->response_sent = true;
 }
 
 static err_t webserver_sent(void *arg, struct tcp_pcb *tpcb, u16_t len)
 {
     conn_state_t *state = (conn_state_t *)arg;
-    if (state && state->response_sent)
+    if (!state)
+        return ERR_OK;
+
+    // Envia mais pedaços, se houver
+    if (state->remaining_len > 0)
     {
-        printf("[WEBSERVER] Dados enviados, fechando conexão com %s\n", ipaddr_ntoa(&tpcb->remote_ip));
+        size_t to_send = state->remaining_len > TCP_CHUNK_SIZE ? TCP_CHUNK_SIZE : state->remaining_len;
+        err_t err = tcp_write(tpcb, state->remaining_data, to_send, TCP_WRITE_FLAG_COPY);
+        if (err != ERR_OK)
+        {
+            printf("[ERRO] Falha ao enviar pedaço restante do corpo HTTP: %d\n", err);
+            tcp_close(tpcb);
+            free(state);
+            return ERR_OK;
+        }
+        state->remaining_data += to_send;
+        state->remaining_len -= to_send;
+
+        err = tcp_output(tpcb);
+        if (err != ERR_OK)
+        {
+            printf("[ERRO] Falha ao forçar envio TCP de pedaço: %d\n", err);
+            tcp_close(tpcb);
+            free(state);
+            return ERR_OK;
+        }
+    }
+    else
+    {
+        // Todos os dados foram enviados
+        printf("[WEBSERVER] Dados enviados completamente para %s\n", ipaddr_ntoa(&tpcb->remote_ip));
         tcp_close(tpcb);
         free(state);
     }
@@ -430,7 +484,8 @@ static void webserver_error(void *arg, err_t err)
     conn_state_t *state = (conn_state_t *)arg;
     if (state)
     {
-        printf("[WEBSERVER] Erro na conexão: %d\n", err);
+        printf("[WEBSERVER] Erro na conexão com %s: %d\n", ipaddr_ntoa(&state->pcb->remote_ip), err);
+        tcp_close(state->pcb);
         free(state);
     }
 }
@@ -535,6 +590,8 @@ static err_t webserver_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     state->pcb = newpcb;
     state->timeout = make_timeout_time_ms(TCP_TIMEOUT_MS);
     state->response_sent = false;
+    state->remaining_data = NULL;
+    state->remaining_len = 0;
 
     // Configura callbacks
     tcp_arg(newpcb, state);
@@ -562,7 +619,7 @@ void tarefa_webserver(void *param)
         return;
     }
 
-    pcb = tcp_listen_with_backlog(pcb, 4);
+    pcb = tcp_listen_with_backlog(pcb, 2); // Reduzido para 2 conexões
     if (!pcb)
     {
         printf("[ERRO] Falha ao configurar servidor TCP para escuta.\n");
@@ -592,7 +649,7 @@ void tarefa_webserver(void *param)
     while (1)
     {
         cyw43_arch_poll();
-        vTaskDelay(pdMS_TO_TICKS(50)); // Ajustado para 50ms
+        vTaskDelay(pdMS_TO_TICKS(100)); // Aumentado para 100ms para reduzir carga
     }
 }
 
