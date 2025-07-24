@@ -5,11 +5,13 @@
  * Descrição: Sistema embarcado para leitura dos sensores AHT20 (temperatura/umidade) e BMP280 (pressão/temperatura),
  *            exibição local em display OLED SSD1306, servidor web responsivo com AJAX, alertas visuais/sonoros e
  *            configuração de limites/offsets via interface web e botões físicos.
+ * Versão: Formulário com 5 containers, lógica de POST /cfg revisada para atualizações individuais robustas.
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/gpio.h"
@@ -53,8 +55,10 @@
 #define ALERT_BEEP_PAUSE 100
 #define WIFI_SSID "Minha Internet"
 #define WIFI_PASS "minhasenha157"
-#define TCP_TIMEOUT_MS 10000 // Timeout de 10 segundos para conexões inativas
-#define TCP_CHUNK_SIZE 512   // Tamanho máximo de cada pedaço de dados enviado
+#define TCP_TIMEOUT_MS 10000
+#define TCP_CHUNK_SIZE 512
+#define MAX_REQUEST_SIZE 1024
+#define WIFI_RECONNECT_INTERVAL_MS 5000
 
 // Limites padrão saudáveis para humanos
 #define TEMP_MIN_DEFAULT 15.0f
@@ -69,7 +73,6 @@ typedef struct
 {
     float temp_aht20;
     float hum_aht20;
-    float temp_bmp280;
     float press_bmp280;
 } sensor_data_t;
 
@@ -86,8 +89,8 @@ typedef struct
     struct tcp_pcb *pcb;
     absolute_time_t timeout;
     bool response_sent;
-    const char *remaining_data; // Dados a serem enviados em pedaços
-    size_t remaining_len;       // Tamanho restante
+    const char *remaining_data;
+    size_t remaining_len;
 } conn_state_t;
 
 // ===================== VARIÁVEIS GLOBAIS =====================
@@ -105,6 +108,9 @@ volatile bool alert_active = false;
 volatile bool wifi_connected = false;
 volatile bool log_medicoes = true;
 
+#define MAX_CONNECTIONS 4
+conn_state_t *active_connections[MAX_CONNECTIONS] = {NULL};
+
 // ===================== PROTÓTIPOS =====================
 void inicializar_hardware(void);
 void inicializar_display(void);
@@ -118,26 +124,163 @@ void tarefa_leitura_sensores(void *param);
 void tarefa_webserver(void *param);
 void tarefa_alerta(void *param);
 void tarefa_display(void *param);
+void tarefa_timeout(void *param);
 void manipulador_interrupcao_gpio(uint gpio, uint32_t eventos);
 void tratar_botao(uint btn);
-static err_t webserver_sent(void *arg, struct tcp_pcb * comerciales, u16_t len);
+static err_t webserver_sent(void *arg, struct tcp_pcb *tpcb, u16_t len);
 static err_t webserver_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err_t err);
 static err_t webserver_accept(void *arg, struct tcp_pcb *newpcb, err_t err);
 void send_http_response(struct tcp_pcb *tpcb, const char *header, const char *body, conn_state_t *state);
+void close_connection(conn_state_t *state);
 
 // ===================== HTML/CSS/JS EMBUTIDO =====================
-// Página HTML otimizada para reduzir tamanho
 const char *html_page =
     "<!DOCTYPE html><html lang='pt'><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Estação BitDogLab</title>"
-    "<style>body{font-family:sans-serif;margin:0;padding:10px;background:#222;color:#eee}h1{font-size:1.5em}#dados{margin:1em 0;font-size:1.1em}input,button{font-size:1em;padding:3px}@media(max-width:600px){body{font-size:1em}}</style>"
-    "</head><body><h1>Estação Meteorológica</h1><div id='dados'>Carregando...</div><canvas id='grafico' width='300' height='100'></canvas>"
-    "<form id='cfg'><h2>Config</h2>"
-    "Temp:<input name='temp_min' type='number' step='0.1' placeholder='Mín'>-<input name='temp_max' type='number' step='0.1' placeholder='Máx'><br>"
-    "Umid:<input name='hum_min' type='number' step='0.1' placeholder='Mín'>-<input name='hum_max' type='number' step='0.1' placeholder='Máx'><br>"
-    "Press:<input name='press_min' type='number' step='0.1' placeholder='Mín'>-<input name='press_max' type='number' step='0.1' placeholder='Máx'><br>"
-    "Offsets: T:<input name='temp_offset' type='number' step='0.1'> U:<input name='hum_offset' type='number' step='0.1'> P:<input name='press_offset' type='number' step='0.1'><br>"
-    "<button type='submit'>Salvar</button></form>"
-    "<script>let d=[];function atualiza(){fetch('/json').then(r=>r.json()).then(j=>{document.getElementById('dados').innerHTML=`Temp: ${j.temp_aht20}°C, Umid: ${j.hum_aht20}%, Press: ${j.press_bmp280}hPa`;d.push(j);if(d.length>50)d.shift();let c=document.getElementById('grafico').getContext('2d');c.clearRect(0,0,300,100);c.strokeStyle='#0f0';c.beginPath();for(let i=0;i<d.length;i++){let y=100-(d[i].temp_aht20*2);c.lineTo(i*6,y);}c.stroke();}).catch(e=>console.error('Erro:',e));}setInterval(atualiza,2000);atualiza();document.getElementById('cfg').onsubmit=e=>{e.preventDefault();let f=new FormData(e.target);fetch('/cfg',{method:'POST',body:new URLSearchParams(f)}).then(()=>alert('Config salva!')).catch(e=>alert('Erro ao salvar.'));}</script></body></html>";
+    "<style>"
+    "body{font-family:Arial,sans-serif;margin:0;padding:20px;background:#222;color:#eee;display:flex;flex-direction:column;align-items:center;min-height:100vh}"
+    "h1{font-size:1.8em;margin-bottom:20px;text-align:center}"
+    "#dados{font-size:1.2em;margin:20px 0;padding:10px;background:#333;border-radius:5px;width:100%;max-width:400px;text-align:center}"
+    ".graficos{display:flex;justify-content:center;gap:20px;flex-wrap:wrap}"
+    ".grafico-container{width:300px;margin:10px 0}"
+    ".grafico-container canvas{border:1px solid #555}"
+    ".grafico-container h3{font-size:1.2em;margin:5px 0;color:#4CAF50;text-align:center}"
+    ".grafico-container .legend{font-size:0.9em;color:#bbb;text-align:center}"
+    "#cfg{width:100%;max-width:600px;background:#333;padding:20px;border-radius:5px;display:grid;gap:15px}"
+    ".title-container{text-align:center}"
+    ".pair-container{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:center}"
+    ".offset-container{display:grid;grid-template-columns:150px 100px 100px;gap:10px;align-items:center}"
+    ".button-container{display:grid;grid-template-columns:1fr;justify-items:center}"
+    ".status-container{text-align:center;font-size:1em;color:#4CAF50}"
+    ".pair-container label,.offset-container label{font-size:1em;color:#eee;text-align:right;min-width:100px}"
+    "input[type=number]{width:100px;padding:5px;border:1px solid #555;border-radius:3px;background:#444;color:#eee;box-sizing:border-box}"
+    ".current-value{font-size:0.9em;color:#4CAF50;text-align:right;width:100px}"
+    "button{padding:8px 16px;background:#4CAF50;border:none;border-radius:3px;color:white;cursor:pointer}"
+    "button:hover{background:#45a049}"
+    "@media(max-width:900px){.graficos{flex-direction:column;align-items:center}.grafico-container{width:100%;max-width:300px}}"
+    "@media(max-width:600px){body{padding:10px}#dados,#cfg{max-width:100%}.pair-container{grid-template-columns:1fr}.offset-container{grid-template-columns:120px 80px 80px}input[type=number]{width:80px}.pair-container label,.offset-container label{min-width:120px}}"
+    "</style></head>"
+    "<body><h1>Estação Meteorológica</h1><div id='dados'>Carregando...</div>"
+    "<div class='graficos'>"
+    "<div class='grafico-container'><h3>Temperatura (°C)</h3><canvas id='grafico-temp' width='300' height='100'></canvas><div id='legend-temp' class='legend'></div></div>"
+    "<div class='grafico-container'><h3>Umidade (%)</h3><canvas id='grafico-hum' width='300' height='100'></canvas><div id='legend-hum' class='legend'></div></div>"
+    "<div class='grafico-container'><h3>Pressão (hPa)</h3><canvas id='grafico-press' width='300' height='100'></canvas><div id='legend-press' class='legend'></div></div>"
+    "</div>"
+    "<form id='cfg'>"
+    "<div class='title-container'><h2>Configuração</h2></div>"
+    "<div class='pair-container'>"
+    "<div><label>Temp Mín (°C):</label><input name='temp_min' type='number' step='0.1' placeholder='15.0'><span class='current-value' id='current-temp-min'></span></div>"
+    "<div><label>Temp Máx (°C):</label><input name='temp_max' type='number' step='0.1' placeholder='30.0'><span class='current-value' id='current-temp-max'></span></div>"
+    "</div>"
+    "<div class='pair-container'>"
+    "<div><label>Umid Mín (%):</label><input name='hum_min' type='number' step='0.1' placeholder='30.0'><span class='current-value' id='current-hum-min'></span></div>"
+    "<div><label>Umid Máx (%):</label><input name='hum_max' type='number' step='0.1' placeholder='70.0'><span class='current-value' id='current-hum-max'></span></div>"
+    "</div>"
+    "<div class='pair-container'>"
+    "<div><label>Press Mín (hPa):</label><input name='press_min' type='number' step='0.1' placeholder='950.0'><span class='current-value' id='current-press-min'></span></div>"
+    "<div><label>Press Máx (hPa):</label><input name='press_max' type='number' step='0.1' placeholder='1050.0'><span class='current-value' id='current-press-max'></span></div>"
+    "</div>"
+    "<div class='offset-container'><h3>Offsets</h3></div>"
+    "<div class='offset-container'><label>Offset Temp (°C):</label><input name='temp_offset' type='number' step='0.1' placeholder='0.0'><span class='current-value' id='current-temp-offset'></span></div>"
+    "<div class='offset-container'><label>Offset Umid (%):</label><input name='hum_offset' type='number' step='0.1' placeholder='0.0'><span class='current-value' id='current-hum-offset'></span></div>"
+    "<div class='offset-container'><label>Offset Press (hPa):</label><input name='press_offset' type='number' step='0.1' placeholder='0.0'><span class='current-value' id='current-press-offset'></span></div>"
+    "<div class='button-container'><button type='submit'>Salvar</button></div>"
+    "<div class='status-container' id='status'></div>"
+    "</form>"
+    "<script>"
+    "let d = []; const dadosEl = document.getElementById('dados'); const statusEl = document.getElementById('status');"
+    "let config = {temp_min: 15, temp_max: 30, hum_min: 30, hum_max: 70, press_min: 950, press_max: 1050, temp_offset: 0, hum_offset: 0, press_offset: 0};"
+    "async function loadConfig() {"
+    "  try {"
+    "    const r = await fetch('/config', { method: 'GET', headers: { 'Accept': 'application/json' } });"
+    "    if (!r.ok) throw new Error(`Erro HTTP ${r.status}: ${r.statusText}`);"
+    "    config = await r.json();"
+    "    document.getElementById('current-temp-min').textContent = `${config.temp_min.toFixed(1)}`;"
+    "    document.getElementById('current-temp-max').textContent = `${config.temp_max.toFixed(1)}`;"
+    "    document.getElementById('current-hum-min').textContent = `${config.hum_min.toFixed(1)}`;"
+    "    document.getElementById('current-hum-max').textContent = `${config.hum_max.toFixed(1)}`;"
+    "    document.getElementById('current-press-min').textContent = `${config.press_min.toFixed(1)}`;"
+    "    document.getElementById('current-press-max').textContent = `${config.press_max.toFixed(1)}`;"
+    "    document.getElementById('current-temp-offset').textContent = `${config.temp_offset.toFixed(1)}`;"
+    "    document.getElementById('current-hum-offset').textContent = `${config.hum_offset.toFixed(1)}`;"
+    "    document.getElementById('current-press-offset').textContent = `${config.press_offset.toFixed(1)}`;"
+    "    document.querySelector('input[name=\"temp_min\"]').value = config.temp_min.toFixed(1);"
+    "    document.querySelector('input[name=\"temp_max\"]').value = config.temp_max.toFixed(1);"
+    "    document.querySelector('input[name=\"hum_min\"]').value = config.hum_min.toFixed(1);"
+    "    document.querySelector('input[name=\"hum_max\"]').value = config.hum_max.toFixed(1);"
+    "    document.querySelector('input[name=\"press_min\"]').value = config.press_min.toFixed(1);"
+    "    document.querySelector('input[name=\"press_max\"]').value = config.press_max.toFixed(1);"
+    "    document.querySelector('input[name=\"temp_offset\"]').value = config.temp_offset.toFixed(1);"
+    "    document.querySelector('input[name=\"hum_offset\"]').value = config.hum_offset.toFixed(1);"
+    "    document.querySelector('input[name=\"press_offset\"]').value = config.press_offset.toFixed(1);"
+    "  } catch (e) {"
+    "    console.error('Erro ao carregar configuração:', e);"
+    "    statusEl.textContent = `Erro ao carregar config: ${e.message}`; statusEl.style.color = '#f44336';"
+    "  }"
+    "}"
+    "async function atualiza() {"
+    "  try {"
+    "    const r = await fetch('/json', { method: 'GET', headers: { 'Accept': 'application/json' } });"
+    "    if (!r.ok) throw new Error(`Erro HTTP ${r.status}: ${r.statusText}`);"
+    "    const j = await r.json();"
+    "    dadosEl.textContent = `Temp: ${j.temp_aht20.toFixed(1)}°C | Umid: ${j.hum_aht20.toFixed(1)}% | Press: ${j.press_bmp280.toFixed(1)}hPa`;"
+    "    d.push(j); if (d.length > 50) d.shift();"
+    "    const drawGraph = (canvasId, dataKey, color, min, max, unit) => {"
+    "      const canvas = document.getElementById(canvasId);"
+    "      const ctx = canvas.getContext('2d');"
+    "      ctx.clearRect(0, 0, canvas.width, canvas.height);"
+    "      const range = max - min; const scale = 80 / range;"
+    "      ctx.strokeStyle = '#555'; ctx.lineWidth = 1;"
+    "      ctx.beginPath(); ctx.moveTo(0, 10); ctx.lineTo(300, 10); ctx.stroke();"
+    "      ctx.beginPath(); ctx.moveTo(0, 90); ctx.lineTo(300, 90); ctx.stroke();"
+    "      ctx.font = '10px Arial'; ctx.fillStyle = '#bbb';"
+    "      ctx.fillText(`${max.toFixed(1)}${unit}`, 5, 15);"
+    "      ctx.fillText(`${min.toFixed(1)}${unit}`, 5, 95);"
+    "      ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();"
+    "      for (let i = 0; i < d.length; i++) {"
+    "        const y = 90 - ((d[i][dataKey] - min) * scale);"
+    "        ctx.lineTo(i * 6, y);"
+    "      }"
+    "      ctx.stroke();"
+    "      document.getElementById(`legend-${canvasId.split('-')[1]}`).textContent = `Atual: ${j[dataKey].toFixed(1)}${unit} | Min: ${min.toFixed(1)}${unit} | Max: ${max.toFixed(1)}${unit}`;"
+    "    };"
+    "    drawGraph('grafico-temp', 'temp_aht20', '#ff5555', config.temp_min, config.temp_max, '°C');"
+    "    drawGraph('grafico-hum', 'hum_aht20', '#55aaff', config.hum_min, config.hum_max, '%');"
+    "    drawGraph('grafico-press', 'press_bmp280', '#55ff55', config.press_min, config.press_max, 'hPa');"
+    "  } catch (e) {"
+    "    console.error('Erro ao atualizar dados:', e);"
+    "    dadosEl.textContent = 'Erro ao carregar dados';"
+    "    statusEl.textContent = `Erro: ${e.message}`; statusEl.style.color = '#f44336';"
+    "  }"
+    "}"
+    "setInterval(atualiza, 2000); atualiza(); loadConfig();"
+    "document.getElementById('cfg').addEventListener('submit', async e => {"
+    "  e.preventDefault(); statusEl.textContent = 'Salvando...'; statusEl.style.color = '#4CAF50';"
+    "  try {"
+    "    const f = new FormData(e.target);"
+    "    const data = new URLSearchParams();"
+    "    for (let [key, value] of f.entries()) {"
+    "      if (value.trim() !== '') data.append(key, value);"
+    "    }"
+    "    if (data.toString() === '') {"
+    "      statusEl.textContent = 'Nenhum valor preenchido'; statusEl.style.color = '#f44336';"
+    "      return;"
+    "    }"
+    "    console.log('Enviando dados:', data.toString());"
+    "    const r = await fetch('/cfg', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: data });"
+    "    const text = await r.text();"
+    "    console.log('Resposta do servidor:', text);"
+    "    if (!r.ok) throw new Error(`Erro HTTP ${r.status}: ${r.statusText}`);"
+    "    let j;"
+    "    try { j = JSON.parse(text); } catch (e) { throw new Error(`Erro ao parsear JSON: ${e.message}`); }"
+    "    statusEl.textContent = j.message; statusEl.style.color = j.status === 'success' ? '#4CAF50' : '#f44336';"
+    "    await loadConfig();"
+    "  } catch (e) {"
+    "    console.error('Erro no POST:', e);"
+    "    statusEl.textContent = `Erro ao salvar: ${e.message}`; statusEl.style.color = '#f44336';"
+    "    await loadConfig();"
+    "  }"
+    "});"
+    "</script></body></html>";
 
 // ===================== FUNÇÃO PRINCIPAL =====================
 int main()
@@ -147,16 +290,15 @@ int main()
     mutex_sensor = xSemaphoreCreateMutex();
     mutex_config = xSemaphoreCreateMutex();
 
-    // Configura interrupções dos botões
     gpio_set_irq_enabled_with_callback(BTN_1, GPIO_IRQ_EDGE_FALL, true, &manipulador_interrupcao_gpio);
     gpio_set_irq_enabled(BTN_2, GPIO_IRQ_EDGE_FALL, true);
     gpio_set_irq_enabled(BTN_3, GPIO_IRQ_EDGE_FALL, true);
 
-    // Cria tarefas
     xTaskCreate(tarefa_leitura_sensores, "LeituraSensores", 1024, NULL, 2, NULL);
     xTaskCreate(tarefa_webserver, "WebServer", 2048, NULL, 3, NULL);
     xTaskCreate(tarefa_alerta, "Alerta", 1024, NULL, 2, NULL);
     xTaskCreate(tarefa_display, "Display", 1024, NULL, 2, NULL);
+    xTaskCreate(tarefa_timeout, "Timeout", 512, NULL, 1, NULL);
 
     vTaskStartScheduler();
     while (1)
@@ -169,30 +311,31 @@ int main()
 // ===================== INICIALIZAÇÃO DE HARDWARE =====================
 void inicializar_hardware(void)
 {
-    // Inicializa I2C dos sensores
     i2c_init(I2C_PORT_SENSORES, 400 * 1000);
     gpio_set_function(I2C_SENS_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SENS_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SENS_SDA);
     gpio_pull_up(I2C_SENS_SCL);
 
-    // Inicializa I2C do display
     i2c_init(I2C_PORT_DISPLAY, 400 * 1000);
     gpio_set_function(I2C_DISP_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_DISP_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_DISP_SDA);
     gpio_pull_up(I2C_DISP_SCL);
 
-    // Inicializa BMP280
     bmp280_init(I2C_PORT_SENSORES);
 
     inicializar_display();
     inicializar_leds();
     inicializar_buzzer();
     inicializar_botoes();
-    cyw43_arch_init();
+    if (cyw43_arch_init() != 0)
+    {
+        printf("[ERRO] Falha ao inicializar cyw43_arch.\n");
+        gpio_put(LED_BLUE_PIN, 1);
+        return;
+    }
     cyw43_arch_enable_sta_mode();
-    cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK);
 }
 
 void inicializar_display(void)
@@ -280,14 +423,12 @@ void emitir_alerta(void)
     }
 }
 
-// ===================== TAREFA: ALERTA =====================
 void tarefa_alerta(void *param)
 {
-    static bool ultimo_alerta = false;
     while (1)
     {
         bool alerta = false;
-        if (xSemaphoreTake(mutex_sensor, pdMS_TO_TICKS(100)))
+        if (xSemaphoreTake(mutex_sensor, pdMS_TO_TICKS(100)) && xSemaphoreTake(mutex_config, pdMS_TO_TICKS(100)))
         {
             if (sensor_data.temp_aht20 < config.temp_min || sensor_data.temp_aht20 > config.temp_max ||
                 sensor_data.hum_aht20 < config.hum_min || sensor_data.hum_aht20 > config.hum_max ||
@@ -296,6 +437,7 @@ void tarefa_alerta(void *param)
                 alerta = true;
             }
             xSemaphoreGive(mutex_sensor);
+            xSemaphoreGive(mutex_config);
         }
         if (alert_active != alerta)
         {
@@ -327,7 +469,7 @@ void atualizar_led_status(void)
     {
         gpio_put(LED_RED_PIN, 0);
         gpio_put(LED_GREEN_PIN, 1);
-        gpio_put(LED_BLUE_PIN, 0);
+        gpio_put(LED_BLUE_PIN, wifi_connected ? 0 : 1);
     }
 }
 
@@ -344,7 +486,6 @@ void tarefa_leitura_sensores(void *param)
     {
         if (xSemaphoreTake(mutex_sensor, pdMS_TO_TICKS(100)))
         {
-            // Leitura do AHT20
             if (aht20_read(I2C_PORT_SENSORES, &aht20))
             {
                 sensor_data.temp_aht20 = aht20.temperature + config.temp_offset;
@@ -353,19 +494,20 @@ void tarefa_leitura_sensores(void *param)
             else
             {
                 printf("[ERRO] Falha na leitura do AHT20.\n");
+                sensor_data.temp_aht20 = 0.0f;
+                sensor_data.hum_aht20 = 0.0f;
             }
 
-            // Leitura do BMP280
             int32_t temp_raw = 0, press_raw = 0;
             bmp280_read_raw(I2C_PORT_SENSORES, &temp_raw, &press_raw);
 
             if (press_raw == 0)
             {
                 printf("[ERRO] Falha na leitura do BMP280: pressão bruta zero.\n");
+                sensor_data.press_bmp280 = 0.0f;
             }
             else
             {
-                sensor_data.temp_bmp280 = bmp280_convert_temp(temp_raw, &bmp280_calib) / 100.0f + config.temp_offset;
                 sensor_data.press_bmp280 = bmp280_convert_pressure(press_raw, temp_raw, &bmp280_calib) / 100.0f + config.press_offset;
             }
 
@@ -373,7 +515,6 @@ void tarefa_leitura_sensores(void *param)
             {
                 printf("[SENSORES] Temperatura: %.1f°C | Umidade: %.1f%% | Pressão: %.1f hPa\n",
                        sensor_data.temp_aht20, sensor_data.hum_aht20, sensor_data.press_bmp280);
-                printf("[DEBUG] BMP280 Raw - Temp: %ld, Press: %ld\n", temp_raw, press_raw);
             }
 
             xSemaphoreGive(mutex_sensor);
@@ -382,26 +523,80 @@ void tarefa_leitura_sensores(void *param)
     }
 }
 
+// ===================== TAREFA: TIMEOUT DE CONEXÕES =====================
+void tarefa_timeout(void *param)
+{
+    while (1)
+    {
+        for (int i = 0; i < MAX_CONNECTIONS; i++)
+        {
+            if (active_connections[i] != NULL)
+            {
+                if (absolute_time_diff_us(get_absolute_time(), active_connections[i]->timeout) / 1000 > TCP_TIMEOUT_MS)
+                {
+                    printf("[TIMEOUT] Fechando conexão inativa com %s\n", ipaddr_ntoa(&active_connections[i]->pcb->remote_ip));
+                    close_connection(active_connections[i]);
+                    active_connections[i] = NULL;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
 // ===================== WEBSERVER =====================
+void close_connection(conn_state_t *state)
+{
+    if (state == NULL || state->pcb == NULL)
+        return;
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++)
+    {
+        if (active_connections[i] == state)
+        {
+            active_connections[i] = NULL;
+            break;
+        }
+    }
+
+    tcp_arg(state->pcb, NULL);
+    tcp_recv(state->pcb, NULL);
+    tcp_sent(state->pcb, NULL);
+    tcp_err(state->pcb, NULL);
+    err_t err = tcp_close(state->pcb);
+    if (err != ERR_OK)
+    {
+        printf("[ERRO] Falha ao fechar conexão: %d\n", err);
+    }
+    free(state);
+}
+
 void send_http_response(struct tcp_pcb *tpcb, const char *header, const char *body, conn_state_t *state)
 {
     err_t err;
 
-    // Envia o cabeçalho
     err = tcp_write(tpcb, header, strlen(header), TCP_WRITE_FLAG_COPY);
     if (err != ERR_OK)
     {
         printf("[ERRO] Falha ao enviar cabeçalho HTTP: %d\n", err);
-        tcp_close(tpcb);
-        free(state);
+        close_connection(state);
         return;
     }
 
-    // Inicializa o envio do corpo em pedaços
-    if (body)
+    if (body && strlen(body) > 0)
     {
         state->remaining_data = body;
         state->remaining_len = strlen(body);
+        size_t to_send = state->remaining_len > TCP_CHUNK_SIZE ? TCP_CHUNK_SIZE : state->remaining_len;
+        err = tcp_write(tpcb, state->remaining_data, to_send, TCP_WRITE_FLAG_COPY);
+        if (err != ERR_OK)
+        {
+            printf("[ERRO] Falha ao enviar corpo HTTP: %d\n", err);
+            close_connection(state);
+            return;
+        }
+        state->remaining_data += to_send;
+        state->remaining_len -= to_send;
     }
     else
     {
@@ -409,33 +604,14 @@ void send_http_response(struct tcp_pcb *tpcb, const char *header, const char *bo
         state->remaining_len = 0;
     }
 
-    // Envia o primeiro pedaço (ou todo o corpo, se pequeno)
-    size_t to_send = state->remaining_len > TCP_CHUNK_SIZE ? TCP_CHUNK_SIZE : state->remaining_len;
-    if (to_send > 0)
-    {
-        err = tcp_write(tpcb, state->remaining_data, to_send, TCP_WRITE_FLAG_COPY);
-        if (err != ERR_OK)
-        {
-            printf("[ERRO] Falha ao enviar pedaço do corpo HTTP: %d\n", err);
-            tcp_close(tpcb);
-            free(state);
-            return;
-        }
-        state->remaining_data += to_send;
-        state->remaining_len -= to_send;
-    }
-
-    // Força o envio dos dados
     err = tcp_output(tpcb);
     if (err != ERR_OK)
     {
         printf("[ERRO] Falha ao forçar envio TCP: %d\n", err);
-        tcp_close(tpcb);
-        free(state);
+        close_connection(state);
         return;
     }
 
-    // Marca a resposta como iniciada
     state->response_sent = true;
 }
 
@@ -445,7 +621,6 @@ static err_t webserver_sent(void *arg, struct tcp_pcb *tpcb, u16_t len)
     if (!state)
         return ERR_OK;
 
-    // Envia mais pedaços, se houver
     if (state->remaining_len > 0)
     {
         size_t to_send = state->remaining_len > TCP_CHUNK_SIZE ? TCP_CHUNK_SIZE : state->remaining_len;
@@ -453,8 +628,7 @@ static err_t webserver_sent(void *arg, struct tcp_pcb *tpcb, u16_t len)
         if (err != ERR_OK)
         {
             printf("[ERRO] Falha ao enviar pedaço restante do corpo HTTP: %d\n", err);
-            tcp_close(tpcb);
-            free(state);
+            close_connection(state);
             return ERR_OK;
         }
         state->remaining_data += to_send;
@@ -464,17 +638,14 @@ static err_t webserver_sent(void *arg, struct tcp_pcb *tpcb, u16_t len)
         if (err != ERR_OK)
         {
             printf("[ERRO] Falha ao forçar envio TCP de pedaço: %d\n", err);
-            tcp_close(tpcb);
-            free(state);
+            close_connection(state);
             return ERR_OK;
         }
     }
     else
     {
-        // Todos os dados foram enviados
         printf("[WEBSERVER] Dados enviados completamente para %s\n", ipaddr_ntoa(&tpcb->remote_ip));
-        tcp_close(tpcb);
-        free(state);
+        close_connection(state);
     }
     return ERR_OK;
 }
@@ -485,51 +656,306 @@ static void webserver_error(void *arg, err_t err)
     if (state)
     {
         printf("[WEBSERVER] Erro na conexão com %s: %d\n", ipaddr_ntoa(&state->pcb->remote_ip), err);
-        tcp_close(state->pcb);
-        free(state);
+        close_connection(state);
     }
 }
 
 static void handle_http_request(struct tcp_pcb *tpcb, const char *req, conn_state_t *state)
 {
+    if (!req || strlen(req) == 0)
+    {
+        printf("[ERRO] Requisição vazia ou nula\n");
+        send_http_response(tpcb, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 11\r\n\r\nBad Request", NULL, state);
+        return;
+    }
+
+    printf("[WEBSERVER] Processando requisição de %s: %.50s...\n", ipaddr_ntoa(&tpcb->remote_ip), req);
+
+    const char *cors_headers = "Access-Control-Allow-Origin: *\r\n"
+                               "Access-Control-Allow-Methods: GET, POST\r\n"
+                               "Access-Control-Allow-Headers: Content-Type\r\n";
+
     if (strstr(req, "GET /json") != NULL)
     {
         char json[128];
         snprintf(json, sizeof(json), "{\"temp_aht20\":%.1f,\"hum_aht20\":%.1f,\"press_bmp280\":%.1f}",
                  sensor_data.temp_aht20, sensor_data.hum_aht20, sensor_data.press_bmp280);
-        send_http_response(tpcb, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n", json, state);
+        char header[256];
+        snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n", cors_headers, strlen(json));
+        send_http_response(tpcb, header, json, state);
+    }
+    else if (strstr(req, "GET /config") != NULL)
+    {
+        char json[256];
+        snprintf(json, sizeof(json), "{\"temp_min\":%.1f,\"temp_max\":%.1f,\"hum_min\":%.1f,\"hum_max\":%.1f,\"press_min\":%.1f,\"press_max\":%.1f,\"temp_offset\":%.1f,\"hum_offset\":%.1f,\"press_offset\":%.1f}",
+                 config.temp_min, config.temp_max, config.hum_min, config.hum_max, config.press_min, config.press_max,
+                 config.temp_offset, config.hum_offset, config.press_offset);
+        char header[256];
+        snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n", cors_headers, strlen(json));
+        send_http_response(tpcb, header, json, state);
     }
     else if (strstr(req, "POST /cfg") != NULL)
     {
         const char *body = strstr(req, "\r\n\r\n");
-        if (body)
+        if (!body)
         {
-            body += 4;
-            float tmin, tmax, hmin, hmax, pmin, pmax, toff, hoff, poff;
-            sscanf(body, "temp_min=%f&temp_max=%f&hum_min=%f&hum_max=%f&press_min=%f&press_max=%f&temp_offset=%f&hum_offset=%f&press_offset=%f",
-                   &tmin, &tmax, &hmin, &hmax, &pmin, &pmax, &toff, &hoff, &poff);
-            if (xSemaphoreTake(mutex_config, pdMS_TO_TICKS(100)))
-            {
-                config.temp_min = tmin;
-                config.temp_max = tmax;
-                config.hum_min = hmin;
-                config.hum_max = hmax;
-                config.press_min = pmin;
-                config.press_max = pmax;
-                config.temp_offset = toff;
-                config.hum_offset = hoff;
-                config.press_offset = poff;
-                xSemaphoreGive(mutex_config);
-                printf("[CONFIG] Limites e offsets atualizados via web.\n");
-            }
+            printf("[ERRO] Corpo da requisição POST não encontrado\n");
+            char header[256];
+            snprintf(header, sizeof(header), "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n%sContent-Length: 45\r\nConnection: close\r\n\r\n", cors_headers);
+            send_http_response(tpcb, header, "{\"status\":\"error\",\"message\":\"Corpo ausente\"}", state);
+            return;
         }
-        send_http_response(tpcb, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n", "OK", state);
+
+        body += 4;
+        char *body_copy = strdup(body);
+        if (!body_copy)
+        {
+            printf("[ERRO] Falha ao alocar memória para corpo da requisição\n");
+            char header[256];
+            snprintf(header, sizeof(header), "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n%sContent-Length: 48\r\nConnection: close\r\n\r\n", cors_headers);
+            send_http_response(tpcb, header, "{\"status\":\"error\",\"message\":\"Erro interno\"}", state);
+            return;
+        }
+
+        bool updated = false;
+        char response[512] = "{\"status\":\"success\",\"message\":\"Configuração salva\",\"updates\":[],\"errors\":[]}";
+        char updates[256] = "[";
+        char errors[256] = "[";
+        bool first_update = true, first_error = true;
+
+        if (xSemaphoreTake(mutex_config, pdMS_TO_TICKS(100)))
+        {
+            char *pair = strtok(body_copy, "&");
+            while (pair)
+            {
+                char *key = strtok(pair, "=");
+                char *value = strtok(NULL, "=");
+                printf("[CONFIG] Recebido par: %s\n", pair);
+
+                if (!key || !value || strlen(value) == 0)
+                {
+                    printf("[INFO] Ignorando par inválido ou vazio: %s\n", pair ? pair : "nulo");
+                    pair = strtok(NULL, "&");
+                    continue;
+                }
+
+                float val;
+                if (sscanf(value, "%f", &val) != 1)
+                {
+                    printf("[ERRO] Valor inválido para %s: %s\n", key, value);
+                    char err_buf[64];
+                    snprintf(err_buf, sizeof(err_buf), "{\"field\":\"%s\",\"error\":\"Valor inválido: %s\"}", key, value);
+                    if (!first_error) strncat(errors, ",", sizeof(errors) - strlen(errors) - 1);
+                    strncat(errors, err_buf, sizeof(errors) - strlen(errors) - 1);
+                    first_error = false;
+                    pair = strtok(NULL, "&");
+                    continue;
+                }
+
+                bool valid = false;
+                char field_name[32];
+                snprintf(field_name, sizeof(field_name), "%s", key);
+
+                if (strcmp(key, "temp_min") == 0)
+                {
+                    if (val >= -50.0f && val <= 50.0f)
+                    {
+                        if (val < config.temp_max)
+                        {
+                            config.temp_min = val;
+                            valid = true;
+                            printf("[CONFIG] Novo temp_min: %.1f\n", val);
+                        }
+                        else
+                        {
+                            printf("[ERRO] temp_min (%.1f) >= temp_max (%.1f)\n", val, config.temp_max);
+                            snprintf(field_name, sizeof(field_name), "%s >= temp_max (%.1f)", key, config.temp_max);
+                        }
+                    }
+                }
+                else if (strcmp(key, "temp_max") == 0)
+                {
+                    if (val >= -50.0f && val <= 50.0f)
+                    {
+                        if (val > config.temp_min)
+                        {
+                            config.temp_max = val;
+                            valid = true;
+                            printf("[CONFIG] Novo temp_max: %.1f\n", val);
+                        }
+                        else
+                        {
+                            printf("[ERRO] temp_max (%.1f) <= temp_min (%.1f)\n", val, config.temp_min);
+                            snprintf(field_name, sizeof(field_name), "%s <= temp_min (%.1f)", key, config.temp_min);
+                        }
+                    }
+                }
+                else if (strcmp(key, "hum_min") == 0)
+                {
+                    if (val >= 0.0f && val <= 100.0f)
+                    {
+                        if (val < config.hum_max)
+                        {
+                            config.hum_min = val;
+                            valid = true;
+                            printf("[CONFIG] Novo hum_min: %.1f\n", val);
+                        }
+                        else
+                        {
+                            printf("[ERRO] hum_min (%.1f) >= hum_max (%.1f)\n", val, config.hum_max);
+                            snprintf(field_name, sizeof(field_name), "%s >= hum_max (%.1f)", key, config.hum_max);
+                        }
+                    }
+                }
+                else if (strcmp(key, "hum_max") == 0)
+                {
+                    if (val >= 0.0f && val <= 100.0f)
+                    {
+                        if (val > config.hum_min)
+                        {
+                            config.hum_max = val;
+                            valid = true;
+                            printf("[CONFIG] Novo hum_max: %.1f\n", val);
+                        }
+                        else
+                        {
+                            printf("[ERRO] hum_max (%.1f) <= hum_min (%.1f)\n", val, config.hum_min);
+                            snprintf(field_name, sizeof(field_name), "%s <= hum_min (%.1f)", key, config.hum_min);
+                        }
+                    }
+                }
+                else if (strcmp(key, "press_min") == 0)
+                {
+                    if (val >= 300.0f && val <= 1100.0f)
+                    {
+                        if (val < config.press_max)
+                        {
+                            config.press_min = val;
+                            valid = true;
+                            printf("[CONFIG] Novo press_min: %.1f\n", val);
+                        }
+                        else
+                        {
+                            printf("[ERRO] press_min (%.1f) >= press_max (%.1f)\n", val, config.press_max);
+                            snprintf(field_name, sizeof(field_name), "%s >= press_max (%.1f)", key, config.press_max);
+                        }
+                    }
+                }
+                else if (strcmp(key, "press_max") == 0)
+                {
+                    if (val >= 300.0f && val <= 1100.0f)
+                    {
+                        if (val > config.press_min)
+                        {
+                            config.press_max = val;
+                            valid = true;
+                            printf("[CONFIG] Novo press_max: %.1f\n", val);
+                        }
+                        else
+                        {
+                            printf("[ERRO] press_max (%.1f) <= press_min (%.1f)\n", val, config.press_min);
+                            snprintf(field_name, sizeof(field_name), "%s <= press_min (%.1f)", key, config.press_min);
+                        }
+                    }
+                }
+                else if (strcmp(key, "temp_offset") == 0)
+                {
+                    if (val >= -10.0f && val <= 10.0f)
+                    {
+                        config.temp_offset = val;
+                        valid = true;
+                        printf("[CONFIG] Novo temp_offset: %.1f\n", val);
+                    }
+                }
+                else if (strcmp(key, "hum_offset") == 0)
+                {
+                    if (val >= -10.0f && val <= 10.0f)
+                    {
+                        config.hum_offset = val;
+                        valid = true;
+                        printf("[CONFIG] Novo hum_offset: %.1f\n", val);
+                    }
+                }
+                else if (strcmp(key, "press_offset") == 0)
+                {
+                    if (val >= -50.0f && val <= 50.0f)
+                    {
+                        config.press_offset = val;
+                        valid = true;
+                        printf("[CONFIG] Novo press_offset: %.1f\n", val);
+                    }
+                }
+                else
+                {
+                    printf("[ERRO] Parâmetro desconhecido: %s\n", key);
+                    snprintf(field_name, sizeof(field_name), "%s (desconhecido)", key);
+                }
+
+                if (!valid)
+                {
+                    char err_buf[64];
+                    snprintf(err_buf, sizeof(err_buf), "{\"field\":\"%s\",\"error\":\"Valor fora do intervalo: %.1f\"}", field_name, val);
+                    if (!first_error) strncat(errors, ",", sizeof(errors) - strlen(errors) - 1);
+                    strncat(errors, err_buf, sizeof(errors) - strlen(errors) - 1);
+                    first_error = false;
+                }
+                else
+                {
+                    updated = true;
+                    char upd_buf[64];
+                    snprintf(upd_buf, sizeof(upd_buf), "{\"field\":\"%s\",\"value\":%.1f}", key, val);
+                    if (!first_update) strncat(updates, ",", sizeof(updates) - strlen(updates) - 1);
+                    strncat(updates, upd_buf, sizeof(updates) - strlen(updates) - 1);
+                    first_update = false;
+                }
+
+                pair = strtok(NULL, "&");
+            }
+
+            strncat(updates, "]", sizeof(updates) - strlen(updates) - 1);
+            strncat(errors, "]", sizeof(errors) - strlen(errors) - 1);
+            snprintf(response, sizeof(response), "{\"status\":\"%s\",\"message\":\"%s\",\"updates\":%s,\"errors\":%s}",
+                     updated ? "success" : "error",
+                     updated ? "Configuração salva" : "Nenhum parâmetro válido aplicado",
+                     updates, errors);
+
+            if (updated)
+            {
+                printf("[CONFIG] Configurações aplicadas: Tmin=%.1f, Tmax=%.1f, Hmin=%.1f, Hmax=%.1f, Pmin=%.1f, Pmax=%.1f, Toff=%.1f, Hoff=%.1f, Poff=%.1f\n",
+                       config.temp_min, config.temp_max, config.hum_min, config.hum_max,
+                       config.press_min, config.press_max, config.temp_offset, config.hum_offset, config.press_offset);
+            }
+            else
+            {
+                printf("[CONFIG] Nenhuma configuração aplicada.\n");
+            }
+
+            xSemaphoreGive(mutex_config);
+        }
+        else
+        {
+            snprintf(response, sizeof(response), "{\"status\":\"error\",\"message\":\"Erro ao acessar configuração\",\"updates\":[],\"errors\":[]}");
+            printf("[ERRO] Falha ao obter mutex_config\n");
+        }
+
+        free(body_copy);
+
+        char header[256];
+        snprintf(header, sizeof(header), "HTTP/1.1 %s\r\nContent-Type: application/json\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n",
+                 updated ? "200 OK" : "400 Bad Request", cors_headers, strlen(response));
+        send_http_response(tpcb, header, response, state);
+    }
+    else if (strstr(req, "GET /") != NULL || strstr(req, "GET /index.html") != NULL)
+    {
+        char header[256];
+        snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n", cors_headers, strlen(html_page));
+        send_http_response(tpcb, header, html_page, state);
     }
     else
     {
-        char header[128];
-        snprintf(header, sizeof(header), "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: %zu\r\n\r\n", strlen(html_page));
-        send_http_response(tpcb, header, html_page, state);
+        char header[256];
+        snprintf(header, sizeof(header), "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n%sContent-Length: 12\r\nConnection: close\r\n\r\n", cors_headers);
+        send_http_response(tpcb, header, "404 Not Found", state);
     }
 }
 
@@ -540,25 +966,27 @@ static err_t webserver_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *p, err
     if (!p)
     {
         printf("[WEBSERVER] Conexão fechada pelo cliente %s\n", ipaddr_ntoa(&tpcb->remote_ip));
-        tcp_close(tpcb);
-        if (state)
-            free(state);
+        close_connection(state);
         return ERR_OK;
     }
 
-    // Atualiza o timeout da conexão
+    if (p->tot_len > MAX_REQUEST_SIZE)
+    {
+        printf("[ERRO] Requisição muito grande de %s: %d bytes\n", ipaddr_ntoa(&tpcb->remote_ip), p->tot_len);
+        send_http_response(tpcb, "HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 16\r\n\r\nPayload Too Large", NULL, state);
+        pbuf_free(p);
+        return ERR_OK;
+    }
+
     state->timeout = make_timeout_time_ms(TCP_TIMEOUT_MS);
 
-    printf("[WEBSERVER] Requisição recebida de %s\n", ipaddr_ntoa(&tpcb->remote_ip));
     char *req = (char *)calloc(1, p->tot_len + 1);
     if (!req)
     {
-        printf("[ERRO] Falha ao alocar memória para requisição.\n");
+        printf("[ERRO] Falha ao alocar memória para requisição de %s\n", ipaddr_ntoa(&tpcb->remote_ip));
+        send_http_response(tpcb, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain\r\nConnection: close\r\nContent-Length: 22\r\n\r\nInternal Server Error", NULL, state);
         pbuf_free(p);
-        tcp_close(tpcb);
-        if (state)
-            free(state);
-        return ERR_MEM;
+        return ERR_OK;
     }
 
     pbuf_copy_partial(p, req, p->tot_len, 0);
@@ -578,11 +1006,26 @@ static err_t webserver_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
         return ERR_VAL;
     }
 
-    // Aloca estado para a nova conexão
+    int free_slot = -1;
+    for (int i = 0; i < MAX_CONNECTIONS; i++)
+    {
+        if (active_connections[i] == NULL)
+        {
+            free_slot = i;
+            break;
+        }
+    }
+    if (free_slot == -1)
+    {
+        printf("[ERRO] Limite de conexões atingido. Rejeitando conexão de %s\n", ipaddr_ntoa(&newpcb->remote_ip));
+        tcp_close(newpcb);
+        return ERR_MEM;
+    }
+
     conn_state_t *state = (conn_state_t *)calloc(1, sizeof(conn_state_t));
     if (!state)
     {
-        printf("[ERRO] Falha ao alocar estado da conexão.\n");
+        printf("[ERRO] Falha ao alocar estado da conexão para %s\n", ipaddr_ntoa(&newpcb->remote_ip));
         tcp_close(newpcb);
         return ERR_MEM;
     }
@@ -593,7 +1036,8 @@ static err_t webserver_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
     state->remaining_data = NULL;
     state->remaining_len = 0;
 
-    // Configura callbacks
+    active_connections[free_slot] = state;
+
     tcp_arg(newpcb, state);
     tcp_recv(newpcb, webserver_recv);
     tcp_sent(newpcb, webserver_sent);
@@ -605,10 +1049,34 @@ static err_t webserver_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 
 void tarefa_webserver(void *param)
 {
+    printf("[WIFI] Iniciando conexão Wi-Fi...\n");
+    int wifi_attempts = 0;
+    const int max_wifi_attempts = 5;
+
+    while (wifi_attempts < max_wifi_attempts)
+    {
+        if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK, 10000) == 0)
+        {
+            wifi_connected = true;
+            break;
+        }
+        printf("[ERRO] Falha na conexão Wi-Fi, tentativa %d/%d\n", wifi_attempts + 1, max_wifi_attempts);
+        wifi_attempts++;
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+    if (!wifi_connected)
+    {
+        printf("[ERRO] Não foi possível conectar ao Wi-Fi após %d tentativas.\n", max_wifi_attempts);
+        gpio_put(LED_BLUE_PIN, 1);
+        return;
+    }
+
     struct tcp_pcb *pcb = tcp_new();
     if (!pcb)
     {
         printf("[ERRO] Falha ao criar PCB do servidor TCP.\n");
+        gpio_put(LED_BLUE_PIN, 1);
         return;
     }
 
@@ -616,40 +1084,40 @@ void tarefa_webserver(void *param)
     {
         printf("[ERRO] Falha ao associar servidor TCP à porta 80.\n");
         tcp_close(pcb);
+        gpio_put(LED_BLUE_PIN, 1);
         return;
     }
 
-    pcb = tcp_listen_with_backlog(pcb, 2); // Reduzido para 2 conexões
+    pcb = tcp_listen_with_backlog(pcb, MAX_CONNECTIONS);
     if (!pcb)
     {
         printf("[ERRO] Falha ao configurar servidor TCP para escuta.\n");
+        gpio_put(LED_BLUE_PIN, 1);
         return;
     }
 
     tcp_accept(pcb, webserver_accept);
-    printf("[WIFI] Aguardando conexão Wi-Fi...\n");
-
-    while (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP)
-    {
-        cyw43_arch_poll();
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    wifi_connected = true;
-    if (netif_default)
-    {
-        printf("[WIFI] Conectado! IP: %s\n", ipaddr_ntoa(&netif_default->ip_addr));
-        printf("[SERVIDOR] Servidor web disponível em http://%s:80\n", ipaddr_ntoa(&netif_default->ip_addr));
-    }
-    else
-    {
-        printf("[ERRO] Não foi possível obter o IP.\n");
-    }
+    printf("[WIFI] Conectado! IP: %s\n", ipaddr_ntoa(&netif_default->ip_addr));
+    printf("[SERVIDOR] Servidor web disponível em http://%s:80\n", ipaddr_ntoa(&netif_default->ip_addr));
 
     while (1)
     {
         cyw43_arch_poll();
-        vTaskDelay(pdMS_TO_TICKS(100)); // Aumentado para 100ms para reduzir carga
+        if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) != CYW43_LINK_UP)
+        {
+            wifi_connected = false;
+            gpio_put(LED_BLUE_PIN, 1);
+            printf("[WIFI] Conexão perdida. Tentando reconectar...\n");
+            cyw43_arch_wifi_connect_async(WIFI_SSID, WIFI_PASS, CYW43_AUTH_WPA2_AES_PSK);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RECONNECT_INTERVAL_MS));
+            if (cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP)
+            {
+                wifi_connected = true;
+                gpio_put(LED_BLUE_PIN, 0);
+                printf("[WIFI] Reconectado! IP: %s\n", ipaddr_ntoa(&netif_default->ip_addr));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
